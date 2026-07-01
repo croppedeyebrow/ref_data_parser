@@ -1,0 +1,18 @@
+
+[시작] 처리 대상: 45개 PDF
+
+처리 중: 1. 과자류 빵류 또는 떡류-1.pdf
+Traceback (most recent call last):
+  File "C:\Users\megaPC\Desktop\kfia_data\parser\kfia_shelf_life_parser.py", line 429, in <module>
+    main()
+    ~~~~^^
+  File "C:\Users\megaPC\Desktop\kfia_data\parser\kfia_shelf_life_parser.py", line 409, in main
+    recs = process_pdf(pdf_path)
+  File "C:\Users\megaPC\Desktop\kfia_data\parser\kfia_shelf_life_parser.py", line 237, in process_pdf
+    code, info = parse_product_page(text)
+                 ~~~~~~~~~~~~~~~~~~^^^^^^
+  File "C:\Users\megaPC\Desktop\kfia_data\parser\kfia_shelf_life_parser.py", line 88, in parse_product_page
+    def parse_product_page(text: str):
+    
+KeyboardInterrupt
+^C
