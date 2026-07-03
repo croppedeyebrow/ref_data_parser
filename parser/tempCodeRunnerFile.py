@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """
 KFIA 식품유형별 소비기한 설정 보고서 PDF 파서
 ============================================
@@ -19,8 +20,6 @@ import sys
 import json
 import sqlite3
 import argparse
-import multiprocessing
-import queue
 from pathlib import Path
 from datetime import datetime
 
@@ -56,7 +55,6 @@ CSV_HEADERS = [
     "품질안전한계기간_일",
     "안전계수",
     "소비기한참고값_일",
-    "단위",
     "온도별_상세_json",
     "source_pdf",
     "source_page",
@@ -69,26 +67,13 @@ CSV_HEADERS = [
 # ---------------------------------------------
 
 def extract_field(label: str, text: str) -> str:
-    # KFIA PDF는 라벨과 값이 서로 다른 줄에 있는 경우가 많다(표 셀 구조).
-    #   식품유형
-    #   과자        <- 값이 다음 줄
-    # 따라서 라벨 뒤 공백/개행을 건너뛰고 다음 비어있지 않은 줄을 값으로 잡는다.
-    m = re.search(label + r"[ \t]*\r?\n?[ \t]*(\S.*)", text)
+    m = re.search(label + r"[ \t]+(.+)", text)
     return (m.group(1).strip().replace(",", "/") if m else "")
 
 
 def parse_days(s: str):
     m = re.match(r"(\d+)일", s.strip())
     return int(m.group(1)) if m else None
-
-
-def to_days(value, unit: str):
-    """단위를 일(日)로 정규화. 시간은 /24 하여 소수 2자리로 반환."""
-    if value is None:
-        return None
-    if unit == "시간":
-        return round(value / 24, 2)
-    return value
 
 
 # ---------------------------------------------
@@ -108,7 +93,7 @@ def parse_product_page(text: str):
         "식품유형":     extract_field("식품유형", text),
         "성상":         extract_field("성상", text),
         "포장방법":     extract_field(r"포장 방법", text),
-        "기존유통기한": extract_field(r"(?:유통|소비)기한\(기존\)", text),
+        "기존유통기한": extract_field(r"유통기한\(기존\)", text),
         "보존유통온도": extract_field(r"보존 및 유통온도", text),
     }
 
@@ -128,33 +113,29 @@ def parse_shelf_life_page(text: str, page_num: int):
 
     lines = text.split("\n")
 
-    lm = re.search(r"품질안전한계기간은\s*(\d+)\s*(일|시간)", text)
+    lm = re.search(r"품질안전한계기간은\s*(\d+)일", text)
     sm = re.search(r"안전계수\s*([\d.]+)", text)
     rm = (
-        re.search(r"소비기한 참고값은\s*(\d+)\s*(일|시간)", text)
-        or re.search(r"최종 소비기한\s*(?:참고값[은]?\s*)?(\d+)\s*(일|시간)", text)
+        re.search(r"소비기한 참고값은\s*(\d+)일", text)
+        or re.search(r"최종 소비기한\s*(?:참고값[은]?\s*)?(\d+)일", text)
     )
-    # 냉장/냉동뿐 아니라 실온·상온(예: 실온(35℃), 상온(25℃))도 인식한다.
-    tm = re.search(r"(냉장|냉동|실온|상온)\((-?\d+℃)\)", text)
+    tm = re.search(r"냉([장동])\((-?\d+℃)\)", text)
 
-    unit = (lm.group(2) if lm else (rm.group(2) if rm else "일"))
-
-    base_method = tm.group(1) if tm else (
-        "실온" if "실온" in text else ("상온" if "상온" in text else "")
+    base_method = ("냉장" if tm.group(1) == "장" else "냉동") if tm else (
+        "실온" if "실온" in text else ""
     )
     base_temp = tm.group(2) if tm else ""
 
-    # 표 안의 값들이 줄바꿈으로 분리돼 있어 아래 패턴으로 추출한다.
-    # <한계기간><단위> ... <안전계수(float)> <소비기한참고값><단위>
-    # 일(日)/시간 두 단위를 모두 인식한다.
-    DATA_PAT = re.compile(
-        r"(\d+)\s*(일|시간)\S*\s+"
+    DATA_LINE = re.compile(
+        r"이화학지표b?\s+"
+        r"(.+?)\s+"
+        r"(\d+일[^\s]*)\s+"
         r"([\d.]+)\s+"
-        r"(\d+)\s*(일|시간)"
+        r"(\d+)일"
     )
 
     TEMP_LINE   = re.compile(r"^(-?\d+℃)$")
-    METHOD_LINE = re.compile(r"^\((냉[장동]|이탈온도|실온|상온)\)$")
+    METHOD_LINE = re.compile(r"^\((냉[장동]|이탈온도)\)$")
 
     temp_positions = []
     for i, line in enumerate(lines):
@@ -165,7 +146,8 @@ def parse_shelf_life_page(text: str, page_num: int):
             for j in range(i + 1, min(i + 4, len(lines))):
                 mm = METHOD_LINE.match(lines[j].strip())
                 if mm:
-                    method = mm.group(1)
+                    raw = mm.group(1)
+                    method = "이탈온도" if raw == "이탈온도" else ("냉장" if "냉장" in raw else "냉동")
                     break
             temp_positions.append((i, temp_val, method))
 
@@ -174,13 +156,19 @@ def parse_shelf_life_page(text: str, page_num: int):
         end_idx = temp_positions[ti + 1][0] if ti + 1 < len(temp_positions) else len(lines)
         block = "\n".join(lines[t_idx:end_idx])
 
-        dm = DATA_PAT.search(block)
+        dm = DATA_LINE.search(block)
         if dm:
-            limit_days = to_days(int(dm.group(1)), dm.group(2))
+            limit_days = parse_days(dm.group(2))
             safety_f   = float(dm.group(3))
-            ref_days   = to_days(int(dm.group(4)), dm.group(5))
+            ref_days   = int(dm.group(4))
         else:
-            limit_days = safety_f = ref_days = None
+            nums = re.findall(r"(\d+)일[^\s]*\s+([\d.]+)\s+(\d+)일", block)
+            if nums:
+                limit_days = int(nums[0][0])
+                safety_f   = float(nums[0][1])
+                ref_days   = int(nums[0][2])
+            else:
+                limit_days = safety_f = ref_days = None
 
         temp_details.append({
             "온도":             temp_val,
@@ -188,38 +176,34 @@ def parse_shelf_life_page(text: str, page_num: int):
             "품질안전한계기간": limit_days,
             "안전계수":         safety_f,
             "소비기한참고값":   ref_days,
-            "단위":             unit,
         })
 
     return code, {
         "보관방법":              base_method,
         "기준온도":              base_temp,
-        "품질안전한계기간_일":   to_days(int(lm.group(1)), lm.group(2)) if lm else None,
+        "품질안전한계기간_일":   int(lm.group(1)) if lm else None,
         "안전계수":              float(sm.group(1)) if sm else None,
-        "소비기한참고값_일":     to_days(int(rm.group(1)), rm.group(2)) if rm else None,
-        "단위":                  unit,
+        "소비기한참고값_일":     int(rm.group(1)) if rm else None,
         "온도별_상세":           temp_details,
         "source_page":           page_num,
     }
 
 
 # ---------------------------------------------
-# PDF 1개 처리 (pymupdf) - worker 함수 (multiprocessing용)
+# PDF 1개 처리 (pymupdf)
 # ---------------------------------------------
 
-def _parse_pdf_worker(pdf_path_str: str, result_queue):
-    """별도 프로세스에서 실행되는 PDF 파싱 워커."""
-    import fitz
-    pdf_path = Path(pdf_path_str)
-    product_info = {}
-    shelf_info   = {}
+def process_pdf(pdf_path: Path) -> list[dict]:
+    product_info: dict[str, dict] = {}
+    shelf_info:   dict[str, dict] = {}
 
     try:
-        doc = fitz.open(pdf_path_str)
+        doc = fitz.open(str(pdf_path))
         for i, page in enumerate(doc, 1):
             try:
                 text = page.get_text() or ""
-            except Exception:
+            except Exception as e:
+                print(f"  [경고] {pdf_path.name} p{i} 스킵: {e}", file=sys.stderr)
                 continue
 
             code, info = parse_product_page(text)
@@ -231,41 +215,10 @@ def _parse_pdf_worker(pdf_path_str: str, result_queue):
                 shelf_info[code] = sl
 
         doc.close()
+
     except Exception as e:
-        result_queue.put(("error", str(e)))
-        return
-
-    result_queue.put(("ok", product_info, shelf_info))
-
-
-def process_pdf(pdf_path: Path, timeout: int = 60) -> list[dict]:
-    """timeout(초) 내에 PDF 파싱. 초과 시 해당 파일 스킵."""
-    q = multiprocessing.Queue()
-    p = multiprocessing.Process(target=_parse_pdf_worker, args=(str(pdf_path), q))
-    p.start()
-
-    # join() 전에 큐를 먼저 읽어야 한다.
-    # 결과 dict가 OS 파이프 버퍼(~64KB)보다 크면, 워커의 피더 스레드가
-    # 파이프를 다 비우지 못해 프로세스가 종료되지 못하고, 부모가 join()에서
-    # 무한 대기하는 데드락이 발생한다. get()으로 먼저 파이프를 비워준다.
-    try:
-        result = q.get(timeout=timeout)
-    except queue.Empty:
-        p.terminate()
-        p.join()
-        print(f"  [타임아웃] {pdf_path.name} 스킵 ({timeout}s 초과)", file=sys.stderr)
+        print(f"  [오류] {pdf_path.name}: {e}", file=sys.stderr)
         return []
-
-    p.join(timeout)
-    if p.is_alive():
-        p.terminate()
-        p.join()
-
-    if result[0] == "error":
-        print(f"  [오류] {pdf_path.name}: {result[1]}", file=sys.stderr)
-        return []
-
-    _, product_info, shelf_info = result
 
     extracted_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     records = []
@@ -284,7 +237,6 @@ def process_pdf(pdf_path: Path, timeout: int = 60) -> list[dict]:
             "품질안전한계기간_일":   sl.get("품질안전한계기간_일"),
             "안전계수":              sl.get("안전계수"),
             "소비기한참고값_일":     sl.get("소비기한참고값_일"),
-            "단위":                  sl.get("단위", "일"),
             "온도별_상세_json":      json.dumps(sl.get("온도별_상세", []), ensure_ascii=False),
             "source_pdf":            pdf_path.name,
             "source_page":           sl.get("source_page"),
@@ -319,10 +271,9 @@ def save_sqlite(records: list[dict], path: Path):
             보존유통온도            TEXT,
             보관방법                TEXT,
             기준온도                TEXT,
-            품질안전한계기간_일     REAL,
+            품질안전한계기간_일     INTEGER,
             안전계수                REAL,
-            소비기한참고값_일       REAL,
-            단위                    TEXT,
+            소비기한참고값_일       INTEGER,
             온도별_상세_json        TEXT,
             source_pdf              TEXT,
             source_page             INTEGER,
@@ -334,7 +285,7 @@ def save_sqlite(records: list[dict], path: Path):
     for r in records:
         cur.execute("""
             INSERT OR IGNORE INTO shelf_life VALUES
-            (NULL,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            (NULL,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, [r[h] for h in CSV_HEADERS])
         if cur.rowcount:
             inserted += 1
@@ -412,8 +363,6 @@ def main():
     parser.add_argument("--db",      default=None, help="SQLite DB 경로")
     parser.add_argument("--json",    default=None, dest="json_out")
     parser.add_argument("--no-csv",  action="store_true")
-    parser.add_argument("--timeout", type=int, default=120,
-                        help="PDF 1개당 최대 처리 시간(초). 초과 시 스킵")
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args()
 
@@ -430,7 +379,7 @@ def main():
     for pdf_path in it:
         if args.verbose:
             print(f"처리 중: {pdf_path.name}")
-        recs = process_pdf(pdf_path, timeout=args.timeout)
+        recs = process_pdf(pdf_path)
         all_records.extend(recs)
         if args.verbose:
             print(f"  -> {len(recs)}건")
@@ -450,5 +399,4 @@ def main():
 
 
 if __name__ == "__main__":
-    multiprocessing.freeze_support()  # Windows exe 패키징 대비
     main()
